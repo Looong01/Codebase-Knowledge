@@ -575,84 +575,77 @@ import json
 import logging
 import os
 import re
+from collections import deque
 from typing import List
 
 from openai import OpenAI
 
 try:
-    import tiktoken  # 可选：更精确地估算 token
-except ImportError:  # noqa: WPS440
+    import tiktoken  # type: ignore
+except ImportError:  # pragma: no cover
     tiktoken = None
 
-# 配置日志
+__all__ = [
+    "call_llm",
+    "DEFAULT_MODEL",
+    "DEFAULT_MAX_CHARS",
+    "MAX_RECURSION_DEPTH",
+]
+
+# ────────────────────────────── Configuration ──────────────────────────────
+
+DEFAULT_MAX_CHARS: int = 13_000  # single OpenAI request budget (≈ tokens)
+DEFAULT_MODEL: str = "<model_name>"  # e.g., "deepseek-r1:latest"
+BASE_URL: str = "<api_base_url>"  # e.g., "http://192.168.1.5:12345/v1"
+CACHE_FILE: str = "llm_cache.json"
+MAX_RECURSION_DEPTH: int = 100  # logical depth, *not* call‑stack depth
+
+# ───────────────────────────────── Logging ─────────────────────────────────
+
 logger = logging.getLogger(__name__)
-cache_file = "llm_cache.json"
-
-
-DEFAULT_MAX_CHARS = 16_000  # 默认最大块大小
-DEFAULT_MODEL = "deepseek-r1-distill-qwen-14b"
-BASE_URL = "http://localhost:12345/v1"  # "https://api.deepseek.com"
-
-CACHE_FILE = "llm_cache.json"
-MAX_RECURSION_DEPTH = 10  # 防御式：最多切 10 层
-
-# logger 基础配置
-logger = logging.getLogger(__name__)
-if not logger.handlers:  # 防止在交互式环境里重复添加 handler
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "[%(levelname)s %(asctime)s] %(message)s",
-        datefmt="%H:%M:%S",
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("[%(levelname)s %(asctime)s] %(message)s", "%H:%M:%S")
     )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)  # 或 DEBUG
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 logger.propagate = False
 
+# ─────────────────────────── Utility helpers ───────────────────────────────
 
-# ─────────────────────────── 工 具 / 辅 助 ────────────────────────────
-def _force_slice(text: str, max_size: int) -> List[str]:
-    """最后兜底：按字符硬切，保证每块 ≤ max_size。"""
+
+def _force_slice(text: str, max_size: int) -> list[str]:
+    """Hard‑slice *text* into ≤ *max_size* char chunks (final fallback)."""
     return [text[i : i + max_size] for i in range(0, len(text), max_size)]  # noqa: E203
 
 
-def split_prompt(prompt: str, max_size: int = DEFAULT_MAX_CHARS) -> List[str]:
-    """
-    智能分割提示文本为多个块：
+def split_prompt(prompt: str, max_size: int = DEFAULT_MAX_CHARS) -> list[str]:
+    """Heuristic splitter (file ➜ class/def ➜ line). Ensures each piece ≤ *max_size*."""
 
-    1. 尝试按  `File:` （常见于 diff / code-review）切分
-    2. 尝试按 `class / def` 切分
-    3. 按行切分
-    4. 任何仍超长的部分 → _force_slice
-
-    永远保证返回的每个 chunk 都 <= max_size。
-    """
-    # ① File 级
+    # ① File‑level diff markers
     file_sections = re.split(r"(?=File:\s+)", prompt)
     if len(file_sections) > 1:
         return _smart_concat(file_sections, max_size)
 
-    # ② class/def 级
-    class_sections = re.split(r"(?=class\s+\w+\s*:|def\s+\w+\()", prompt)
+    # ② class / def boundaries – **regex fixed here**
+    class_sections = re.split(r"(?=class\s+\w+\s*:|def\s+\w+\(\))", prompt)
     if len(class_sections) > 1:
         return _smart_concat(class_sections, max_size)
 
-    # ③ 行级 + 兜底
+    # ③ Fallback – by lines
     return _smart_concat(prompt.splitlines(keepends=True), max_size)
 
 
-def _smart_concat(sections: List[str], max_size: int) -> List[str]:
-    """
-    把若干 section 拼成块：如果 section 太大就 _force_slice，再保证
-    current_chunk 不超过 max_size。
-    """
-    chunks, current = [], ""
+def _smart_concat(sections: list[str], max_size: int) -> list[str]:
+    """Greedily concatenate *sections* into chunks ≤ *max_size* chars."""
+    chunks: list[str] = []
+    current = ""
     for sec in sections:
         if not sec:
             continue
-        # 先兜底切超巨 section
+        # If a *single* section is still too big, slice it hard
         if len(sec) > max_size:
-            # 之前累积的 current 先收尾
             if current:
                 chunks.append(current)
                 current = ""
@@ -660,8 +653,7 @@ def _smart_concat(sections: List[str], max_size: int) -> List[str]:
             continue
 
         if len(current) + len(sec) > max_size:
-            if current:
-                chunks.append(current)
+            chunks.append(current)
             current = sec
         else:
             current += sec
@@ -671,148 +663,398 @@ def _smart_concat(sections: List[str], max_size: int) -> List[str]:
 
 
 def estimate_token_count(text: str) -> int:
-    """
-    估算文本 token 数量。
-    • 若安装了 tiktoken，则按 gpt-2 tokenizer 精确估算
-    • 否则 fallback：平均 1 token ≈ 4 字符
-    """
     if tiktoken:
         enc = tiktoken.get_encoding("gpt2")
         return len(enc.encode(text))
-    # 简易估算
+    # naive fallback: 1 token ≈ 4 chars
     return len(text) // 4
 
 
-# ─────────────────────────────── 主 调 用 ─────────────────────────────
-def call_llm(
-    prompt: str,
-    *,
-    use_cache: bool = True,
-    model: str = DEFAULT_MODEL,
-    max_chunk_size: int = DEFAULT_MAX_CHARS,
-    _depth: int = 0,
-) -> str:
-    """
-    调用 DeepSeek API；自动分块、递归聚合并加多重兜底。
-
-    参数
-    ----
-    prompt : str
-        要发送的完整提示。
-    use_cache : bool
-        是否启用本地 JSON 缓存。子块递归调用时会自动关闭。
-    model : str
-        DeepSeek 模型名。
-    max_chunk_size : int
-        单块最大字符数（注意不是 token）。
-    _depth : int
-        递归层计数（内部使用）。
-    """
-    # ——— 深度守卫 ———
-    if _depth > MAX_RECURSION_DEPTH:
-        raise RuntimeError("Exceeded maximum split depth; prompt may be pathological.")
-
-    # ——— 缓存查找 ———
-    if use_cache and (cached := _cache_get(prompt)):
-        logger.debug("Returned cached response")
-        return cached
-
-    # ——— 长度检查 + 分块 ———
-    if len(prompt) > max_chunk_size or estimate_token_count(prompt) > DEFAULT_MAX_CHARS:
-        if _depth == 0:
-            logger.info(
-                "Prompt too long, splitting into chunks (max %s chars)",
-                max_chunk_size,
-            )
-
-        chunks = split_prompt(prompt, max_chunk_size)
-
-        # 双保险：如果奇怪格式仍只得到 1 个且超长 → 硬切
-        if len(chunks) == 1 and len(chunks[0]) > max_chunk_size:
-            chunks = _force_slice(prompt, max_chunk_size)
-
-        responses = [
-            call_llm(
-                chunk,
-                use_cache=False,  # 子块不写缓存
-                model=model,
-                max_chunk_size=max_chunk_size,
-                _depth=_depth + 1,
-            )
-            for chunk in chunks
-        ]
-        full_resp = "\n\n".join(responses)
-        _cache_set(prompt, full_resp, use_cache)
-        return full_resp
-
-    # ——— 走真正 API ———
-    api_key = os.getenv("DEEPSEEK_API_KEY", "API_KEY")
-    if not api_key:
-        raise RuntimeError("Environment variable DEEPSEEK_API_KEY not set")
-
-    client = OpenAI(api_key=api_key, base_url=BASE_URL)
-
-    try:
-        logger.debug("Sending to DeepSeek (%s)…", model)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=DEFAULT_MAX_CHARS,
-            temperature=0.3,
-            timeout=1000,
-        )
-        answer = resp.choices[0].message.content.strip()
-        _cache_set(prompt, answer, use_cache)  # 写缓存
-        return answer
-
-    except Exception as exc:  # noqa: WPS429
-        # 针对性错误处理（可根据需求再细分）
-        msg = str(exc)
-        if "invalid_api_key" in msg:
-            raise RuntimeError("Invalid DeepSeek API key") from exc
-        if "rate_limit" in msg:
-            raise RuntimeError("Hit DeepSeek rate limit; retry later") from exc
-        if "context_length_exceeded" in msg or "exceeds" in msg:
-            # 理论上不会走到这一步；如果真到了，就递归再缩
-            logger.warning(
-                "DeepSeek context length exceeded, retrying with tighter chunks"
-            )
-            return call_llm(
-                prompt,
-                use_cache=use_cache,
-                model=model,
-                max_chunk_size=int(max_chunk_size * 0.8),
-                _depth=_depth + 1,
-            )
-        raise  # 其他未预料的直接抛出
+# ───────────────────────────── Cache helpers ───────────────────────────────
 
 
-# ──────────────────────────── 缓 存 辅 助 ────────────────────────────
 def _cache_get(prompt: str) -> str | None:
     if not os.path.exists(CACHE_FILE):
         return None
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as fh:
-            cache = json.load(fh)
+            cache: dict[str, str] = json.load(fh)
         return cache.get(prompt)
-    except Exception as exc:  # noqa: WPS429
+    except Exception as exc:  # pragma: no cover
         logger.warning("Cache load error: %s", exc)
         return None
 
 
-def _cache_set(prompt: str, resp: str, enabled: bool = True) -> None:
+def _cache_set(prompt: str, resp: str, *, enabled: bool = True) -> None:
     if not enabled or not resp.strip():
         return
-    try:
-        cache = {}
-        if os.path.exists(CACHE_FILE):
+    cache: dict[str, str] = {}
+    if os.path.exists(CACHE_FILE):
+        try:
             with open(CACHE_FILE, "r", encoding="utf-8") as fh:
                 cache = json.load(fh)
-        cache[prompt] = resp
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Cache read error: %s", exc)
+    cache[prompt] = resp
+    try:
         with open(CACHE_FILE, "w", encoding="utf-8") as fh:
-            json.dump(cache, fh, indent=2, ensure_ascii=False)
-    except Exception as exc:  # noqa: WPS429
-        logger.error("Failed to save cache: %s", exc)
+            json.dump(cache, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:  # pragma: no cover
+        logger.error("Cache write error: %s", exc)
+
+
+# ────────────────────────── Internal split routine ─────────────────────────
+
+
+def _split_to_chunks(
+    text: str,
+    *,
+    max_size: int,
+    max_depth: int = MAX_RECURSION_DEPTH,
+) -> list[str]:
+    """Breadth‑first splitting without recursive call‑stack growth."""
+    from collections import deque
+
+    queue: deque[tuple[str, int]] = deque([(text, 0)])
+    result: list[str] = []
+
+    while queue:
+        current, depth = queue.popleft()
+
+        # char / token guard – split?
+        if (
+            len(current) <= max_size
+            and estimate_token_count(current) <= DEFAULT_MAX_CHARS
+        ):
+            result.append(current)
+            continue
+
+        if depth >= max_depth:
+            logger.warning("Depth %s reached; force‑slicing remaining text", depth)
+            result.extend(_force_slice(current, max_size))
+            continue
+
+        subs = split_prompt(current, max_size)
+        if len(subs) == 1 and len(subs[0]) == len(current):
+            subs = _force_slice(current, max_size)
+        queue.extend((s, depth + 1) for s in subs)
+
+    return result
+
+
+# ───────────────────────────── API interaction ─────────────────────────────
+
+
+def _send_to_deepseek(prompt: str, model: str) -> str:
+    api_key = os.getenv("DEEPSEEK_API_KEY", "sk-b6675fce3b704310bbdbe9946da77530")
+    if not api_key:
+        raise RuntimeError("Environment variable DEEPSEEK_API_KEY not set")
+
+    client = OpenAI(api_key=api_key, base_url=BASE_URL)
+    logger.debug(
+        "[DeepSeek] → %s | %s chars (%s tokens)",
+        model,
+        len(prompt),
+        estimate_token_count(prompt),
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=DEFAULT_MAX_CHARS,
+        temperature=0.3,
+        timeout=1000,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+# ──────────────────────────── Public entrypoint ────────────────────────────
+
+
+def call_llm(
+    prompt: str,
+    *,
+    model: str = DEFAULT_MODEL,
+    max_chunk_size: int = DEFAULT_MAX_CHARS,
+    use_cache: bool = True,
+) -> str:
+    """High‑level helper that transparently splits, caches and stitches."""
+
+    cached = _cache_get(prompt) if use_cache else None
+    if cached is not None:
+        logger.debug("Returned cached response")
+        return cached
+
+    chunks = _split_to_chunks(prompt, max_size=max_chunk_size)
+    if len(chunks) > 1:
+        logger.info("Prompt split into %s chunks", len(chunks))
+
+    responses: list[str] = []
+    for idx, chunk in enumerate(chunks, 1):
+        cached_piece = _cache_get(chunk) if use_cache else None
+        if cached_piece is None:
+            logger.info("Calling DeepSeek [%s/%s]…", idx, len(chunks))
+            piece = _send_to_deepseek(chunk, model)
+            _cache_set(chunk, piece, enabled=use_cache)
+        else:
+            logger.debug("Using cached piece [%s/%s]", idx, len(chunks))
+            piece = cached_piece
+        responses.append(piece)
+
+    full_resp = "\n\n".join(responses)
+    _cache_set(prompt, full_resp, enabled=use_cache)
+    return full_resp
+
+
+if __name__ == "__main__":
+    test_prompt = "Hello, how are you?"
+
+    # First call - should hit the API
+    print("Making call...")
+    response1 = call_llm(test_prompt, use_cache=False)
+    print(f"Response: {response1}")
+import json
+import logging
+import os
+import re
+from collections import deque
+from typing import List
+
+from openai import OpenAI
+
+try:
+    import tiktoken  # type: ignore
+except ImportError:  # pragma: no cover
+    tiktoken = None
+
+__all__ = [
+    "call_llm",
+    "DEFAULT_MODEL",
+    "DEFAULT_MAX_CHARS",
+    "MAX_RECURSION_DEPTH",
+]
+
+# ────────────────────────────── Configuration ──────────────────────────────
+
+DEFAULT_MAX_CHARS: int = 13_000  # single OpenAI request budget (≈ tokens)
+DEFAULT_MODEL: str = "deepseek-r1:latest"
+BASE_URL: str = "http://5j44925h56.oicp.vip:9434/v1"
+# DEFAULT_MODEL: str = "deepseek-r1-distill-qwen-14b"
+# BASE_URL: str = "http://localhost:12345/v1"
+CACHE_FILE: str = "llm_cache.json"
+MAX_RECURSION_DEPTH: int = 100  # logical depth, *not* call‑stack depth
+
+# ───────────────────────────────── Logging ─────────────────────────────────
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("[%(levelname)s %(asctime)s] %(message)s", "%H:%M:%S")
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+logger.propagate = False
+
+# ─────────────────────────── Utility helpers ───────────────────────────────
+
+
+def _force_slice(text: str, max_size: int) -> list[str]:
+    """Hard‑slice *text* into ≤ *max_size* char chunks (final fallback)."""
+    return [text[i : i + max_size] for i in range(0, len(text), max_size)]  # noqa: E203
+
+
+def split_prompt(prompt: str, max_size: int = DEFAULT_MAX_CHARS) -> list[str]:
+    """Heuristic splitter (file ➜ class/def ➜ line). Ensures each piece ≤ *max_size*."""
+
+    # ① File‑level diff markers
+    file_sections = re.split(r"(?=File:\s+)", prompt)
+    if len(file_sections) > 1:
+        return _smart_concat(file_sections, max_size)
+
+    # ② class / def boundaries – **regex fixed here**
+    class_sections = re.split(r"(?=class\s+\w+\s*:|def\s+\w+\(\))", prompt)
+    if len(class_sections) > 1:
+        return _smart_concat(class_sections, max_size)
+
+    # ③ Fallback – by lines
+    return _smart_concat(prompt.splitlines(keepends=True), max_size)
+
+
+def _smart_concat(sections: list[str], max_size: int) -> list[str]:
+    """Greedily concatenate *sections* into chunks ≤ *max_size* chars."""
+    chunks: list[str] = []
+    current = ""
+    for sec in sections:
+        if not sec:
+            continue
+        # If a *single* section is still too big, slice it hard
+        if len(sec) > max_size:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_force_slice(sec, max_size))
+            continue
+
+        if len(current) + len(sec) > max_size:
+            chunks.append(current)
+            current = sec
+        else:
+            current += sec
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def estimate_token_count(text: str) -> int:
+    if tiktoken:
+        enc = tiktoken.get_encoding("gpt2")
+        return len(enc.encode(text))
+    # naive fallback: 1 token ≈ 4 chars
+    return len(text) // 4
+
+
+# ───────────────────────────── Cache helpers ───────────────────────────────
+
+
+def _cache_get(prompt: str) -> str | None:
+    if not os.path.exists(CACHE_FILE):
+        return None
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as fh:
+            cache: dict[str, str] = json.load(fh)
+        return cache.get(prompt)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Cache load error: %s", exc)
+        return None
+
+
+def _cache_set(prompt: str, resp: str, *, enabled: bool = True) -> None:
+    if not enabled or not resp.strip():
+        return
+    cache: dict[str, str] = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as fh:
+                cache = json.load(fh)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Cache read error: %s", exc)
+    cache[prompt] = resp
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:  # pragma: no cover
+        logger.error("Cache write error: %s", exc)
+
+
+# ────────────────────────── Internal split routine ─────────────────────────
+
+
+def _split_to_chunks(
+    text: str,
+    *,
+    max_size: int,
+    max_depth: int = MAX_RECURSION_DEPTH,
+) -> list[str]:
+    """Breadth‑first splitting without recursive call‑stack growth."""
+    from collections import deque
+
+    queue: deque[tuple[str, int]] = deque([(text, 0)])
+    result: list[str] = []
+
+    while queue:
+        current, depth = queue.popleft()
+
+        # char / token guard – split?
+        if (
+            len(current) <= max_size
+            and estimate_token_count(current) <= DEFAULT_MAX_CHARS
+        ):
+            result.append(current)
+            continue
+
+        if depth >= max_depth:
+            logger.warning("Depth %s reached; force‑slicing remaining text", depth)
+            result.extend(_force_slice(current, max_size))
+            continue
+
+        subs = split_prompt(current, max_size)
+        if len(subs) == 1 and len(subs[0]) == len(current):
+            subs = _force_slice(current, max_size)
+        queue.extend((s, depth + 1) for s in subs)
+
+    return result
+
+
+# ───────────────────────────── API interaction ─────────────────────────────
+
+
+def _send_to_deepseek(prompt: str, model: str) -> str:
+    api_key = os.getenv("DEEPSEEK_API_KEY", "sk-b6675fce3b704310bbdbe9946da77530")
+    if not api_key:
+        raise RuntimeError("Environment variable DEEPSEEK_API_KEY not set")
+
+    client = OpenAI(api_key=api_key, base_url=BASE_URL)
+    logger.debug(
+        "[DeepSeek] → %s | %s chars (%s tokens)",
+        model,
+        len(prompt),
+        estimate_token_count(prompt),
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=DEFAULT_MAX_CHARS,
+        temperature=0.3,
+        timeout=1000,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+# ──────────────────────────── Public entrypoint ────────────────────────────
+
+
+def call_llm(
+    prompt: str,
+    *,
+    model: str = DEFAULT_MODEL,
+    max_chunk_size: int = DEFAULT_MAX_CHARS,
+    use_cache: bool = True,
+) -> str:
+    """High‑level helper that transparently splits, caches and stitches."""
+
+    cached = _cache_get(prompt) if use_cache else None
+    if cached is not None:
+        logger.debug("Returned cached response")
+        return cached
+
+    chunks = _split_to_chunks(prompt, max_size=max_chunk_size)
+    if len(chunks) > 1:
+        logger.info("Prompt split into %s chunks", len(chunks))
+
+    responses: list[str] = []
+    for idx, chunk in enumerate(chunks, 1):
+        cached_piece = _cache_get(chunk) if use_cache else None
+        if cached_piece is None:
+            logger.info("Calling DeepSeek [%s/%s]…", idx, len(chunks))
+            piece = _send_to_deepseek(chunk, model)
+            _cache_set(chunk, piece, enabled=use_cache)
+        else:
+            logger.debug("Using cached piece [%s/%s]", idx, len(chunks))
+            piece = cached_piece
+        responses.append(piece)
+
+    full_resp = "\n\n".join(responses)
+    _cache_set(prompt, full_resp, enabled=use_cache)
+    return full_resp
+
+
+if __name__ == "__main__":
+    test_prompt = "Hello, how are you?"
+
+    # First call - should hit the API
+    print("Making call...")
+    response1 = call_llm(test_prompt, use_cache=False)
+    print(f"Response: {response1}")
 
 
 if __name__ == "__main__":
