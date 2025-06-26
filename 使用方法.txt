@@ -1,1 +1,1 @@
-python main.py --dir <repo路径> --max-size 500000  --language "Chinese"
+python main.py --dir <repo的本地路径> --max-size 500000  --language "Chinese"
